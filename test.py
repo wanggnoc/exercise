@@ -1,3 +1,21 @@
+def cid_from_other_source():
+    """
+    some drug can not be found in pychem, so I try to find some cid manually.
+    the small_molecule.csv is downloaded from http://lincs.hms.harvard.edu/db/sm/
+    """
+    f = open(folder + "small_molecule.csv", 'r')
+    reader = csv.reader(f)
+    reader.next()
+    cid_dict = {}
+    for item in reader:
+        name = item[1]
+        cid = item[4]
+        if not name in cid_dict: 
+            cid_dict[name] = str(cid)
+    unknow_drug = open(folder + "unknow_drug_by_pychem.csv").readline().split(",")
+    drug_cid_dict = {k:v for k,v in cid_dict.iteritems() if k in unknow_drug and not is_not_float([v])}
+    return drug_cid_dict
+
 def save_cell_mut_matrix():
     f = open("PANCANCER_Genetic_feature.csv")
     reader = csv.reader(f)
@@ -26,9 +44,6 @@ def save_cell_mut_matrix():
     for item in matrix_list:
         cell_feature[item[0], item[1]] = 1
     return cell_dict, cell_feature
-
-
-
 
 ##############
 def save_mix_drug_cell_matrix():
@@ -215,31 +230,126 @@ class TestbedDataset(InMemoryDataset):
             smiles = xd[i]
             target = xt[i]
             labels = y[i]
-            # convert SMILES to molecular representation using rdkit
             c_size, features, edge_index = smile_graph[smiles]
-            # make the graph ready for PyTorch Geometrics GCN algorithms:
             GCNData = DATA.Data(x=torch.Tensor(features),
                                 edge_index=torch.LongTensor(edge_index).transpose(1, 0),
                                 y=torch.FloatTensor([labels]))            
-            # require_grad of cell-line for saliency map
             if self.saliency_map == True:
                 GCNData.target = torch.tensor([target], dtype=torch.float, requires_grad=True)
             else:
                 GCNData.target = torch.FloatTensor([target])
-
             GCNData.__setitem__('c_size', torch.LongTensor([c_size]))
-            # append graph, label and target sequence to data list
             data_list.append(GCNData)
-
         if self.pre_filter is not None:
             data_list = [data for data in data_list if self.pre_filter(data)]
-
         if self.pre_transform is not None:
             data_list = [self.pre_transform(data) for data in data_list]
         print('Graph construction done. Saving to file.')
         data, slices = self.collate(data_list)
-        # save preprocessed data:
         torch.save((data, slices), self.processed_paths[0])
-
     def getXD(self):
         return self.xd
+
+xd_train = xd[:size]
+xd_val = xd[size:size1]
+xd_test = xd[size1:]
+
+xc_train = xc[:size]
+xc_val = xc[size:size1]
+xc_test = xc[size1:]
+
+y_train = y[:size]
+y_val = y[size:size1]
+y_test = y[size1:]
+
+python training.py --model 0 --train_batch 1024 --val_batch 1024
+ --test_batch 1024 --lr 0.0001 --num_epoch 300 --log_interval 20 --cuda_name "cuda:0"
+
+
+def train(model, device, train_loader, optimizer, epoch, log_interval):
+    print('Training on {} samples...'.format(len(train_loader.dataset)))
+    model.train()
+    loss_fn = nn.MSELoss()
+    avg_loss = []
+    for batch_idx, data in enumerate(train_loader):
+        data = data.to(device)
+        optimizer.zero_grad()
+        output, _ = model(data)
+        loss = loss_fn(output, data.y.view(-1, 1).float().to(device))
+        loss.backward()
+        optimizer.step()
+        avg_loss.append(loss.item())
+        if batch_idx % log_interval == 0:
+            print('Train epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(epoch,
+                                                                           batch_idx * len(data.x),
+                                                                           len(train_loader.dataset),
+                                                                           100. * batch_idx / len(train_loader),
+                                                                           loss.item()))
+    return sum(avg_loss)/len(avg_loss)
+
+for epoch in range(num_epoch):
+    train_loss = train(model, device, train_loader, optimizer, epoch+1, log_interval)
+    G,P = predicting(model, device, val_loader)
+    ret = [rmse(G,P),mse(G,P),pearson(G,P),spearman(G,P)] 
+    G_test,P_test = predicting(model, device, test_loader)
+    ret_test = [rmse(G_test,P_test),mse(G_test,P_test),pearson(G_test,P_test),spearman(G_test,P_test)]
+    train_losses.append(train_loss)
+    val_losses.append(ret[1])
+    val_pearsons.append(ret[2])
+    if ret[1]<best_mse:
+        torch.save(model.state_dict(), model_file_name)
+        with open(result_file_name,'w') as f:
+            f.write(','.join(map(str,ret_test)))
+        best_epoch = epoch+1
+        best_mse = ret[1]
+        best_pearson = ret[2]
+        print(' rmse improved at epoch ', best_epoch, '; best_mse:', best_mse,model_st,dataset)
+    else:
+        print(' no improvement since epoch ', best_epoch, '; best_mse, best pearson:', best_mse, best_pearson, model_st, dataset)
+draw_loss(train_losses, val_losses, loss_fig_name)
+draw_pearson(val_pearsons, pearson_fig_name)
+
+def calculate_value_individual_drug(modeling, num_mut, cuda_name, processed_data_file, model_file):
+    dataset = "GDSC"
+    with open ('mut_dict', 'rb') as fp:
+        mut_dict = pickle.load(fp)
+        mut_arr = np.asarray([k for k, v in mut_dict.items()]) 
+    if (not os.path.isfile(processed_data_file)):
+        print('please run create_data.py to prepare data in pytorch format!')
+    else:
+        test_data = TestbedDataset(root='data', dataset=dataset+'_bortezomib')
+        test_loader = DataLoader(test_data)
+        model_st = modeling.__name__
+        print('\npredicting for ', dataset, ' using ', model_st)
+        device = torch.device(cuda_name if torch.cuda.is_available() else "cpu")
+        model = modeling().to(device)
+        lstY = []
+        lstM = []
+        lstV = []
+        if os.path.isfile(model_file):
+            model.load_state_dict(torch.load(model_file))
+            model.eval()
+            for data in test_loader:
+                data = data.to(device)
+                output, _ = model(data)
+                data.target.retain_grad()
+                output.backward()
+                lstY.append(data.y.cpu().numpy()[0])
+                grad = data.target.grad
+                values, indexes = grad.topk(num_mut)
+                lstV.append(values)
+                lstM.append(mut_arr[np.squeeze(np.asarray(indexes.cpu().numpy()))])
+        else:
+            print('model is not available!')
+        listCell = []
+        with open ('cell_blind_sal', 'rb') as fp:
+            listCell = pickle.load(fp)
+        lstTopY = [lstY[k] for k in np.asarray(lstY).argsort()[:num_mut]]
+        lstTopM = [lstM[k] for k in np.asarray(lstY).argsort()[:num_mut]]
+        lstV = [lstV[k] for k in np.asarray(lstY).argsort()[:num_mut]]
+        listCell = [listCell[k] for k in np.asarray(lstY).argsort()[:num_mut]]
+        print(lstTopM)
+        print(lstV)
+
+python saliency_map.py --model 0 --num_feature 10 --processed_data_file "data/processed/GDSC_bortezomib.pt" 
+--model_file "model_GINConvNet_GDSC.model" --cuda_name "cuda:0"
